@@ -1,0 +1,338 @@
+"""
+AI Code Reviewer - Streamlit app
+
+Deliverables in this single file:
+- A Streamlit app that accepts pasted Python code or a .py upload
+- Runs style checks via flake8 (file-based) and shows issues
+- Shows Black's formatted suggestion (before/after) using black API
+- Measures complexity & maintainability with radon
+- Summarizes improvements and displays before/after suggestions
+- Exports a Markdown report for download
+
+Requirements (put in requirements.txt):
+streamlit
+black
+flake8
+radon
+
+Run:
+pip install -r requirements.txt
+streamlit run app.py
+
+Note: This file writes to temporary files for flake8 (which uses file paths). The code uses the public APIs of black and radon when available. If your environment lacks a package, pip install the packages above.
+"""
+
+import streamlit as st
+import tempfile
+import os
+import io
+import difflib
+import datetime
+
+# External libs that should be installed in the environment
+try:
+    from flake8.api import legacy as flake8
+except Exception:
+    flake8 = None
+
+try:
+    import black
+except Exception:
+    black = None
+
+try:
+    from radon.complexity import cc_visit, cc_rank
+    from radon.metrics import mi_visit, mi_rank
+    from radon.raw import analyze as raw_analyze
+except Exception:
+    cc_visit = None
+    cc_rank = None
+    mi_visit = None
+    mi_rank = None
+    raw_analyze = None
+
+
+def run_flake8_on_file(path):
+    """Run flake8 on the given file path and return a list of message dicts."""
+    if flake8 is None:
+        return [{"error": "flake8 not installed in environment"}]
+
+    style_guide = flake8.get_style_guide(ignore=[], max_line_length=88)
+    report = style_guide.check_files([path])
+
+    # Flake8's API doesn't give a direct list of messages, but report.get_statistics() is available.
+    stats = report.get_statistics("")
+    # For a richer output, run the CLI via subprocess or parse output. Here we'll run CLI-like output
+    out = []
+    try:
+        import subprocess
+        proc = subprocess.run(["flake8", path], capture_output=True, text=True)
+        stdout = proc.stdout.strip()
+        if stdout:
+            for line in stdout.splitlines():
+                # typical: filename:line:col: CODE message
+                parts = line.split(":", 3)
+                if len(parts) >= 4:
+                    _, lineno, col, rest = parts
+                    code_and_msg = rest.strip()
+                    code = code_and_msg.split()[0]
+                    message = " ".join(code_and_msg.split()[1:])
+                    out.append({"line": int(lineno), "col": int(col), "code": code, "message": message})
+        else:
+            out = []
+    except Exception as e:
+        out = [{"error": f"failed to run flake8 CLI: {e}"}]
+
+    return out
+
+
+def format_with_black(code_text):
+    """Return formatted code using Black or error message if unavailable."""
+    if black is None:
+        return None, "black not installed in environment"
+    try:
+        formatted = black.format_str(code_text, mode=black.FileMode())
+        return formatted, None
+    except Exception as e:
+        return None, str(e)
+
+
+def radon_analysis(code_text):
+    """Return raw metrics, maintainability, and complexity report."""
+    if raw_analyze is None:
+        return {"error": "radon not installed in environment"}
+
+    raw = raw_analyze(code_text)
+    try:
+        mi_score = mi_visit(code_text, True)
+    except Exception:
+        # older/newer radon versions differ; fallback
+        try:
+            mi_score = mi_visit(code_text)
+        except Exception:
+            mi_score = None
+
+    try:
+        cc_items = cc_visit(code_text)
+    except Exception:
+        cc_items = []
+
+    # Build summary
+    cc_list = []
+    for item in cc_items:
+        # item has .name, .complexity, .lineno, .col_offset
+        cc_list.append({"name": getattr(item, "name", "<unknown>"), "complexity": getattr(item, "complexity", None), "lineno": getattr(item, "lineno", None)})
+
+    return {
+        "raw": {
+            "loc": raw.loc,
+            "lloc": raw.lloc,
+            "sloc": raw.sloc,
+            "comments": raw.comments,
+            "multi": raw.multi,
+            "blank": raw.blank,
+        },
+        "mi": mi_score,
+        "cc": cc_list,
+    }
+
+
+def generate_suggestions(flakes, mi_score, cc_list):
+    suggestions = []
+
+    if isinstance(flakes, list) and len(flakes) == 0:
+        suggestions.append("No style issues found by flake8.")
+    elif isinstance(flakes, list):
+        suggestions.append(f"Found {len(flakes)} flake8 issue(s). Consider fixing these before finalizing code.")
+        # show sample top issues
+        for f in flakes[:6]:
+            if "error" in f:
+                suggestions.append(f"flake8 error: {f['error']}")
+            else:
+                suggestions.append(f"Line {f['line']}:{f['col']} — {f['code']} {f['message']}")
+
+    if mi_score is not None:
+        # mi_rank exists sometimes
+        try:
+            rank = mi_rank(mi_score)
+        except Exception:
+            rank = None
+        suggestions.append(f"Maintainability index (MI): {mi_score:.1f}" + (f" — {rank}" if rank else ""))
+        if mi_score < 70:
+            suggestions.append("MI is below 70 — consider refactoring for readability and maintainability.")
+
+    high_cc = [c for c in cc_list if c.get("complexity") is not None and c.get("complexity") >= 10]
+    if high_cc:
+        suggestions.append(f"{len(high_cc)} function(s) with cyclomatic complexity >= 10 — consider breaking them into smaller functions:")
+        for c in high_cc[:6]:
+            suggestions.append(f" - {c['name']} (complexity {c['complexity']}) at line {c['lineno']}")
+    else:
+        suggestions.append("No exceptionally complex functions found (no CC >= 10).")
+
+    return suggestions
+
+
+def make_markdown_report(code_text, formatted_text, flakes, radon_results):
+    t = []
+    t.append(f"# Code Review Report")
+    t.append(f"Generated: {datetime.datetime.utcnow().isoformat()}Z")
+    t.append("\n## Original code (truncated if long)")
+    t.append("```python")
+    t.append(code_text[:4000])
+    t.append("```")
+
+    if formatted_text:
+        t.append("\n## Black formatted suggestion")
+        t.append("```python")
+        t.append(formatted_text[:4000])
+        t.append("```")
+
+    t.append("\n## flake8 issues")
+    if isinstance(flakes, list) and len(flakes) > 0:
+        for f in flakes:
+            if "error" in f:
+                t.append(f"- ERROR: {f['error']}")
+            else:
+                t.append(f"- Line {f['line']}:{f['col']} — {f['code']} {f['message']}")
+    else:
+        t.append("No flake8 issues found.")
+
+    t.append("\n## Radon/Static metrics")
+    if "error" in radon_results:
+        t.append(f"Radon error: {radon_results['error']}")
+    else:
+        raw = radon_results.get("raw", {})
+        t.append(f"- LOC: {raw.get('loc')}")
+        t.append(f"- Logical LOC: {raw.get('lloc')}")
+        t.append(f"- Source lines (sloc): {raw.get('sloc')}")
+        t.append(f"- Comments: {raw.get('comments')}")
+        mi = radon_results.get("mi")
+        if mi is not None:
+            t.append(f"- Maintainability index (MI): {mi}")
+        cc = radon_results.get("cc", [])
+        if cc:
+            t.append("\n### Cyclomatic complexity (top items)")
+            for c in sorted(cc, key=lambda x: -x.get("complexity", 0))[:10]:
+                t.append(f"- {c['name']}: complexity {c['complexity']} (line {c['lineno']})")
+
+    return "\n".join(t)
+
+
+# Streamlit UI
+st.set_page_config(page_title="AI Code Reviewer", layout="wide")
+st.title("AI Code Reviewer")
+st.markdown("Paste Python code in the box or upload a .py file. Click **Analyze** to run style, format, and complexity checks.")
+
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    uploaded = st.file_uploader("Upload a .py file", type=["py"])
+    code_input = st.text_area("Or paste Python code here", height=300)
+
+with col2:
+    st.header("Options")
+    run_on_click = st.button("Analyze")
+    show_flake8_cli = st.checkbox("Show flake8 raw output (CLI)", value=False)
+    cc_threshold = st.number_input("Flag functions with CC >=", min_value=2, max_value=50, value=10)
+
+# Preference: prefer uploaded file content
+code_text = None
+if uploaded is not None:
+    try:
+        code_text = uploaded.getvalue().decode("utf-8")
+    except Exception:
+        code_text = uploaded.getvalue().decode("latin-1")
+elif code_input and code_input.strip():
+    code_text = code_input
+
+if run_on_click:
+    if not code_text:
+        st.warning("Please paste code or upload a .py file before analyzing.")
+    else:
+        st.info("Analyzing — this may take a few seconds...")
+
+        # Create a temporary file for flake8
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = os.path.join(tmpdir, "candidate.py")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(code_text)
+
+            flakes = run_flake8_on_file(tmp_path)
+
+            formatted, black_err = format_with_black(code_text)
+
+            radon_results = radon_analysis(code_text)
+
+            # generate suggestions
+            suggestions = generate_suggestions(flakes if isinstance(flakes, list) else [], (radon_results.get("mi") if isinstance(radon_results, dict) else None), (radon_results.get("cc") if isinstance(radon_results, dict) else []))
+
+            # Show summary
+            st.subheader("Summary")
+            st.markdown(f"**fl ake8 issues:** {len(flakes) if isinstance(flakes, list) else 'N/A'}")
+            mi_val = radon_results.get("mi") if isinstance(radon_results, dict) else None
+            st.markdown(f"**Maintainability index (MI):** {f'{mi_val:.1f}' if isinstance(mi_val, (int, float)) else 'N/A'}")
+            st.markdown(f"**Functions with CC >= {cc_threshold}:** {len([c for c in radon_results.get('cc', []) if c.get('complexity') and c.get('complexity') >= cc_threshold])}")
+
+            st.subheader("Suggestions")
+            for s in suggestions:
+                st.write("- ", s)
+
+            # Side-by-side code before/after
+            st.subheader("Before / After (Black suggestion)")
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**Original**")
+                st.code(code_text, language="python")
+            with right:
+                st.markdown("**Black formatted**")
+                if formatted:
+                    st.code(formatted, language="python")
+                else:
+                    st.write(f"Black not available: {black_err}")
+
+            # Show flake8 raw output optional
+            if show_flake8_cli:
+                st.subheader("flake8 raw output (CLI)")
+                if isinstance(flakes, list) and len(flakes) > 0:
+                    for f in flakes:
+                        if "error" in f:
+                            st.write(f"ERROR: {f['error']}")
+                        else:
+                            st.write(f"Line {f['line']}:{f['col']} — {f['code']} {f['message']}")
+                else:
+                    st.write("No flake8 issues found.")
+
+            # Diff view
+            if formatted:
+                st.subheader("Unified diff (original -> formatted)")
+                diff = difflib.unified_diff(code_text.splitlines(), formatted.splitlines(), fromfile="original", tofile="black_formatted", lineterm="")
+                st.text("\n".join(diff))
+
+            # Radon CC table
+            st.subheader("Cyclomatic Complexity (radon)")
+            cc_list = radon_results.get("cc", []) if isinstance(radon_results, dict) else []
+            if cc_list:
+                import pandas as pd
+
+                df = pd.DataFrame(cc_list)
+                df = df.sort_values(by="complexity", ascending=False)
+                st.dataframe(df)
+            else:
+                st.write("No complexity items found or radon not available.")
+
+            # Export report
+            st.subheader("Export report")
+            report_md = make_markdown_report(code_text, formatted, flakes if isinstance(flakes, list) else [], radon_results if isinstance(radon_results, dict) else {"error": "radon missing"})
+            st.download_button("Download Markdown report", report_md, file_name="code_review_report.md", mime="text/markdown")
+
+            # Optionally write the report to disk for local demonstration
+            # (useful if someone wants a sample report created by the app)
+            sample_path = os.path.join(tmpdir, "sample_report.md")
+            with open(sample_path, "w", encoding="utf-8") as f:
+                f.write(report_md)
+
+            st.success("Analysis complete. You can download the report or view suggestions above.")
+
+# Provide a small sample quick-run example block (only visible in UI)
+st.markdown("---")
+st.markdown("**Tips:**\n- Install the packages: `pip install streamlit black flake8 radon`\n- For CI integration, run `flake8` + `radon cc` + `radon mi` as part of your pipeline.\n- Use `black` to autoformat on save and re-run flake8 to reduce style issues.")
