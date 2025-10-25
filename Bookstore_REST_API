@@ -1,0 +1,305 @@
+"""
+Bookstore REST API (FastAPI + SQLAlchemy + SQLite)
+Compatible with Pydantic v2 and Python 3.12/3.13
+
+How to run:
+1. python3 -m venv .venv && source .venv/bin/activate
+2. pip install fastapi uvicorn sqlalchemy pydantic python-multipart
+3. uvicorn main:app --reload
+
+Docs:
+- Swagger UI: http://127.0.0.1:8000/docs
+- Redoc:      http://127.0.0.1:8000/redoc
+"""
+
+from typing import List, Optional, Annotated
+from fastapi import FastAPI, HTTPException, Depends, Query, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, StringConstraints, field_validator, PositiveFloat
+from sqlalchemy import (
+    Column, Integer, String, Float, Text, create_engine, select, and_, or_
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import os
+import json
+
+# ---------- Database setup ----------
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(BASE_DIR, "bookstore.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+# ---------- Models ----------
+class Book(Base):
+    __tablename__ = "books"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False, index=True)
+    author = Column(String(255), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    price = Column(Float, nullable=False, default=0.0)
+    isbn = Column(String(20), unique=True, nullable=True, index=True)
+    tags = Column(String(255), nullable=True, index=True)  # comma-separated tags
+
+
+# ---------- Pydantic Schemas ----------
+TitleStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+AuthorStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+ISBNStr = Annotated[Optional[str], StringConstraints(strip_whitespace=True, max_length=20)]
+TagList = Optional[List[Annotated[str, StringConstraints(strip_whitespace=True, max_length=50)]]]
+
+
+class BookBase(BaseModel):
+    title: TitleStr
+    author: AuthorStr
+    description: Optional[str] = Field(None, max_length=2000)
+    price: PositiveFloat
+    isbn: ISBNStr = None
+    tags: TagList = None
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def allow_comma_separated(cls, v):
+        """Allow tags to be either a list or comma-separated string"""
+        if v is None:
+            return v
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        return v
+
+
+class BookCreate(BookBase):
+    pass
+
+
+class BookUpdate(BaseModel):
+    title: Optional[TitleStr] = None
+    author: Optional[AuthorStr] = None
+    description: Optional[str] = Field(None, max_length=2000)
+    price: Optional[PositiveFloat] = None
+    isbn: ISBNStr = None
+    tags: TagList = None
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def allow_comma_separated(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        return v
+
+
+class BookOut(BookBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+# ---------- FastAPI app ----------
+app = FastAPI(title="Bookstore REST API", version="2.0")
+
+
+# Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ---------- Utility helpers ----------
+def tags_list_to_str(tags: Optional[List[str]]) -> Optional[str]:
+    if tags is None:
+        return None
+    return ",".join([t.strip() for t in tags if t and t.strip()])
+
+
+# ---------- CRUD Routes ----------
+@app.post("/books/", response_model=BookOut, status_code=status.HTTP_201_CREATED)
+def create_book(book_in: BookCreate, db: Session = Depends(get_db)):
+    if book_in.isbn:
+        existing = db.query(Book).filter(Book.isbn == book_in.isbn).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="ISBN already exists")
+
+    book = Book(
+        title=book_in.title,
+        author=book_in.author,
+        description=book_in.description,
+        price=float(book_in.price),
+        isbn=book_in.isbn,
+        tags=tags_list_to_str(book_in.tags),
+    )
+    db.add(book)
+    db.commit()
+    db.refresh(book)
+    return book
+
+
+@app.get("/books/{book_id}", response_model=BookOut)
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.query(Book).get(book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return book
+
+
+@app.put("/books/{book_id}", response_model=BookOut)
+def update_book(book_id: int, book_in: BookUpdate, db: Session = Depends(get_db)):
+    book = db.query(Book).get(book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    update_data = book_in.model_dump(exclude_unset=True)
+    if "tags" in update_data:
+        update_data["tags"] = tags_list_to_str(update_data["tags"])
+    if "price" in update_data:
+        update_data["price"] = float(update_data["price"])
+
+    for k, v in update_data.items():
+        setattr(book, k, v)
+
+    db.add(book)
+    db.commit()
+    db.refresh(book)
+    return book
+
+
+@app.delete("/books/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.query(Book).get(book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    db.delete(book)
+    db.commit()
+    return None
+
+
+@app.get("/books/", response_model=List[BookOut])
+def list_books(
+    db: Session = Depends(get_db),
+    q: Optional[str] = Query(None, description="Search in title, author, description"),
+    author: Optional[str] = None,
+    title: Optional[str] = None,
+    tag: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    query = db.query(Book)
+
+    filters = []
+    if q:
+        like = f"%{q}%"
+        filters.append(or_(Book.title.ilike(like), Book.author.ilike(like), Book.description.ilike(like)))
+    if author:
+        filters.append(Book.author.ilike(f"%{author}%"))
+    if title:
+        filters.append(Book.title.ilike(f"%{title}%"))
+    if tag:
+        filters.append(Book.tags.ilike(f"%{tag}%"))
+    if min_price is not None:
+        filters.append(Book.price >= float(min_price))
+    if max_price is not None:
+        filters.append(Book.price <= float(max_price))
+
+    if filters:
+        query = query.filter(and_(*filters))
+
+    return query.order_by(Book.id.desc()).limit(limit).offset(offset).all()
+
+
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
+
+
+# ---------- Startup: create DB & example Postman collection ----------
+@app.on_event("startup")
+def startup_event():
+    Base.metadata.create_all(bind=engine)
+
+    collection = {
+        "info": {
+            "name": "Bookstore API - Example",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        "item": [
+            {
+                "name": "Create Book",
+                "request": {
+                    "method": "POST",
+                    "header": [{"key": "Content-Type", "value": "application/json"}],
+                    "body": {
+                        "mode": "raw",
+                        "raw": json.dumps(
+                            {
+                                "title": "Example Book",
+                                "author": "Jane Doe",
+                                "description": "An example book",
+                                "price": 9.99,
+                                "isbn": "ISBN-EX-001",
+                                "tags": ["example", "demo"],
+                            },
+                            indent=2,
+                        ),
+                    },
+                    "url": {"raw": "http://127.0.0.1:8000/books/"},
+                },
+            },
+            {"name": "List Books", "request": {"method": "GET", "url": {"raw": "http://127.0.0.1:8000/books/"}}},
+        ],
+    }
+
+    try:
+        with open(os.path.join(BASE_DIR, "postman_collection.json"), "w", encoding="utf-8") as f:
+            json.dump(collection, f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------- Optional seed endpoint ----------
+@app.post("/seed-sample", status_code=201)
+def seed_sample(db: Session = Depends(get_db)):
+    """Create sample books for testing."""
+    samples = [
+        {
+            "title": "Deep Learning with Python",
+            "author": "Francois Chollet",
+            "description": "A practical guide",
+            "price": 39.99,
+            "isbn": "9781617294433",
+            "tags": ["ml", "python"],
+        },
+        {
+            "title": "Fluent Python",
+            "author": "Luciano Ramalho",
+            "description": "Pythonic programming techniques",
+            "price": 45.0,
+            "isbn": "9781491946008",
+            "tags": ["python", "advanced"],
+        },
+    ]
+    created = []
+    for s in samples:
+        if not db.query(Book).filter(Book.isbn == s["isbn"]).first():
+            b = Book(
+                title=s["title"],
+                author=s["author"],
+                description=s["description"],
+                price=float(s["price"]),
+                isbn=s["isbn"],
+                tags=tags_list_to_str(s["tags"]),
+            )
+            db.add(b)
+            created.append(s["title"])
+    db.commit()
+    return {"created": created}
